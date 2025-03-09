@@ -62,8 +62,10 @@ from ultralytics.nn.modules import (
     Segment,
     TorchVision,
     WorldDetect,
-    v10Detect,
+    v10Detect
 )
+from ultralytics.nn.conv.APConv import PConv
+
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
@@ -953,6 +955,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     base_modules = frozenset(
         {
+            PConv,
             Classify,
             Conv,
             ConvTranspose,
