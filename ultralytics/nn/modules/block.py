@@ -4,7 +4,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torch.nn import init
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
@@ -50,8 +50,309 @@ __all__ = (
     "PSA",
     "SCDown",
     "TorchVision",
+    "FeaturePyramidSharedConv","PyramidContextExtraction","ContextGuideFusionModule",
+    "RCM","FuseBlockMulti","DynamicInterpolationFusion"
 )
 
+
+######################################## ContextGuideFusionModule begin ########################################
+
+class ContextGuideFusionModule(nn.Module):
+    def __init__(self, inc) -> None:
+        super().__init__()
+
+        self.adjust_conv = nn.Identity()
+        if inc[0] != inc[1]:
+            self.adjust_conv = Conv(inc[0], inc[1], k=1)
+
+        self.se = SEAttention(inc[1] * 2)
+
+    def forward(self, x):
+        x0, x1 = x
+        x0 = self.adjust_conv(x0)
+
+        x_concat = torch.cat([x0, x1], dim=1)  # n c h w
+        x_concat = self.se(x_concat)
+        x0_weight, x1_weight = torch.split(x_concat, [x0.size()[1], x1.size()[1]], dim=1)
+        x0_weight = x0 * x0_weight
+        x1_weight = x1 * x1_weight
+        return torch.cat([x0 + x1_weight, x1 + x0_weight], dim=1)
+
+class SEAttention(nn.Module):
+    def __init__(self, channel=512,reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                init.constant_(m.weight, 1)
+                init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                init.normal_(m.weight, std=0.001)
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+######################################## ContextGuideFusionModule end ########################################
+
+######################################## PyramidContextExtraction start ########################################
+class PyramidContextExtraction(nn.Module):
+    def __init__(self, dim, n=3) -> None:
+        super().__init__()
+
+        self.dim = dim
+        self.ppa = PyramidPoolAgg_PCE()
+        self.rcm = nn.Sequential(*[RCA(sum(dim), 3, 2, square_kernel_size=1) for _ in range(n)])
+
+    def forward(self, x):
+        x = self.ppa(x)
+        x = self.rcm(x)
+        return torch.split(x, self.dim, dim=1)
+######################################## PyramidContextExtraction end ########################################
+
+######################################## Rectangular Self-Calibration Module [ECCV-24] start ########################################
+
+class PyramidPoolAgg_PCE(nn.Module):
+    def __init__(self, stride=2):
+        super().__init__()
+        self.stride = stride
+
+    def forward(self, inputs):
+        B, C, H, W = inputs[-1].shape
+        H = (H - 1) // self.stride + 1
+        W = (W - 1) // self.stride + 1
+        return torch.cat([nn.functional.adaptive_avg_pool2d(inp, (H, W)) for inp in inputs], dim=1)
+
+
+class ConvMlp(nn.Module):
+    """ MLP using 1x1 convs that keeps spatial dims
+    copied from timm: https://github.com/huggingface/pytorch-image-models/blob/v0.6.11/timm/models/layers/mlp.py
+    """
+
+    def __init__(
+            self, in_features, hidden_features=None, out_features=None, act_layer=nn.ReLU,
+            norm_layer=None, bias=True, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+
+        self.fc1 = nn.Conv2d(in_features, hidden_features, kernel_size=1, bias=bias)
+        self.norm = norm_layer(hidden_features) if norm_layer else nn.Identity()
+        self.act = act_layer()
+        self.drop = nn.Dropout(drop)
+        self.fc2 = nn.Conv2d(hidden_features, out_features, kernel_size=1, bias=bias)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.norm(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        return x
+
+
+class RCA(nn.Module):
+    def __init__(self, inp, kernel_size=1, ratio=2, band_kernel_size=11, dw_size=(1, 1), padding=(0, 0), stride=1,
+                 square_kernel_size=3, relu=True):
+        super(RCA, self).__init__()
+        self.dwconv_hw = nn.Conv2d(inp, inp, square_kernel_size, padding=square_kernel_size // 2, groups=inp)
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        gc = inp // ratio
+        self.excite = nn.Sequential(
+            nn.Conv2d(inp, gc, kernel_size=(1, band_kernel_size), padding=(0, band_kernel_size // 2), groups=gc),
+            nn.BatchNorm2d(gc),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(gc, inp, kernel_size=(band_kernel_size, 1), padding=(band_kernel_size // 2, 0), groups=gc),
+            nn.Sigmoid()
+        )
+
+    def sge(self, x):
+        # [N, D, C, 1]
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x)
+        x_gather = x_h + x_w  # .repeat(1,1,1,x_w.shape[-1])
+        ge = self.excite(x_gather)  # [N, 1, C, 1]
+
+        return ge
+
+    def forward(self, x):
+        loc = self.dwconv_hw(x)
+        att = self.sge(x)
+        out = att * loc
+
+        return out
+
+
+class RCM(nn.Module):
+    """ MetaNeXtBlock Block
+    Args:
+        dim (int): Number of input channels.
+        drop_path (float): Stochastic depth rate. Default: 0.0
+        ls_init_value (float): Init value for Layer Scale. Default: 1e-6.
+    """
+
+    def __init__(
+            self,
+            dim,
+            token_mixer=RCA,
+            norm_layer=nn.BatchNorm2d,
+            mlp_layer=ConvMlp,
+            mlp_ratio=2,
+            act_layer=nn.GELU,
+            ls_init_value=1e-6,
+            drop_path=0.,
+            dw_size=11,
+            square_kernel_size=3,
+            ratio=1,
+    ):
+        super().__init__()
+        self.token_mixer = token_mixer(dim, band_kernel_size=dw_size, square_kernel_size=square_kernel_size,
+                                       ratio=ratio)
+        self.norm = norm_layer(dim)
+        self.mlp = mlp_layer(dim, int(mlp_ratio * dim), act_layer=act_layer)
+        self.gamma = nn.Parameter(ls_init_value * torch.ones(dim)) if ls_init_value else None
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x):
+        shortcut = x
+        x = self.token_mixer(x)
+        x = self.norm(x)
+        x = self.mlp(x)
+        if self.gamma is not None:
+            x = x.mul(self.gamma.reshape(1, -1, 1, 1))
+        x = self.drop_path(x) + shortcut
+        return x
+
+
+class multiRCM(nn.Module):
+    def __init__(self, dim, n=3) -> None:
+        super().__init__()
+        self.mrcm = nn.Sequential(*[RCA(dim, 3, 2, square_kernel_size=1) for _ in range(n)])
+
+    def forward(self, x):
+        return self.mrcm(x)
+
+
+class PyramidContextExtraction(nn.Module):
+    def __init__(self, dim, n=3) -> None:
+        super().__init__()
+
+        self.dim = dim
+        self.ppa = PyramidPoolAgg_PCE()
+        self.rcm = nn.Sequential(*[RCA(sum(dim), 3, 2, square_kernel_size=1) for _ in range(n)])
+
+    def forward(self, x):
+        x = self.ppa(x)
+        x = self.rcm(x)
+        return torch.split(x, self.dim, dim=1)
+
+
+class FuseBlockMulti(nn.Module):
+    def __init__(
+            self,
+            inp: int,
+    ) -> None:
+        super(FuseBlockMulti, self).__init__()
+
+        self.fuse1 = Conv(inp, inp, act=False)
+        self.fuse2 = Conv(inp, inp, act=False)
+        self.act = h_sigmoid()
+
+    def forward(self, x):
+        x_l, x_h = x
+        B, C, H, W = x_l.shape
+        inp = self.fuse1(x_l)
+        sig_act = self.fuse2(x_h)
+        sig_act = F.interpolate(self.act(sig_act), size=(H, W), mode='bilinear', align_corners=False)
+        out = inp * sig_act
+        return out
+
+
+class DynamicInterpolationFusion(nn.Module):
+    def __init__(self, chn) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(chn[1], chn[0], kernel_size=1)
+
+    def forward(self, x):
+        return x[0] + self.conv(F.interpolate(x[1], size=x[0].size()[2:], mode='bilinear', align_corners=False))
+
+
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
+    """
+
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
+class h_sigmoid(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_sigmoid, self).__init__()
+        self.relu = nn.ReLU6(inplace=inplace)
+
+    def forward(self, x):
+        return self.relu(x + 3) / 6
+
+def drop_path(x, drop_prob: float = 0., training: bool = False):
+    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
+    This is the same as the DropConnect impl I created for EfficientNet, etc networks, however,
+    the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
+    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for
+    changing the layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use
+    'survival rate' as the argument.
+    """
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()  # binarize
+    output = x.div(keep_prob) * random_tensor
+    return output
+######################################## Rectangular Self-Calibration Module [ECCV-24] end ########################################
+
+
+######################################## FeaturePyramidSharedConv Module start ########################################
+
+class FeaturePyramidSharedConv(nn.Module):
+    def __init__(self, c1, c2, dilations=[1, 3, 5]) -> None:
+        super().__init__()
+
+        c_ = c1 // 2  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_ * (1 + len(dilations)), c2, 1, 1)
+        self.share_conv = nn.Conv2d(in_channels=c_, out_channels=c_, kernel_size=3, stride=1, padding=1, bias=False)
+        self.dilations = dilations
+
+    def forward(self, x):
+        y = [self.cv1(x)]
+        for dilation in self.dilations:
+            y.append(F.conv2d(y[-1], weight=self.share_conv.weight, bias=None, dilation=dilation,
+                              padding=(dilation * (3 - 1) + 1) // 2))
+        return self.cv2(torch.cat(y, 1))
+
+
+######################################## FeaturePyramidSharedConv Module end ########################################
 
 class DFL(nn.Module):
     """

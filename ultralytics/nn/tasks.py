@@ -62,8 +62,10 @@ from ultralytics.nn.modules import (
     Segment,
     TorchVision,
     WorldDetect,
-    v10Detect
+    v10Detect, RCM, TripletAttention,FeaturePyramidSharedConv,
+    PyramidContextExtraction,FuseBlockMulti,DynamicInterpolationFusion
 )
+from ultralytics.nn.extra_modules import GetIndexOutput
 from ultralytics.nn.conv.APConv import PConv
 
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
@@ -955,6 +957,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     base_modules = frozenset(
         {
+            FeaturePyramidSharedConv,
             PConv,
             Classify,
             Conv,
@@ -1046,6 +1049,13 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                     args.extend((True, 1.2))
         elif m is AIFI:
             args = [ch[f], *args]
+        elif m in {TripletAttention, RCM}:
+            c2 = ch[f]
+            args = [c2, *args]
+        elif m in {PyramidContextExtraction}:
+            c1 = [ch[x] for x in f]
+            c2 = c1
+            args = [c1]
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
@@ -1076,9 +1086,20 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        elif m in {GetIndexOutput}:
+            c2 = ch[f][args[0]]
+        elif m in {FuseBlockMulti}:
+            c2 = ch[f[0]]
+            args = [c2]
+        elif m in {DynamicInterpolationFusion}:
+            c2 = ch[f[0]]
+            args = [[ch[x] for x in f]]
         else:
             c2 = ch[f]
-
+        if isinstance(c2, list) and m not in {PyramidContextExtraction}:
+            is_backbone = True
+            m_ = m
+            m_.backbone = True
         m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
         t = str(m)[8:-2].replace("__main__.", "")  # module type
         m_.np = sum(x.numel() for x in m_.parameters())  # number params

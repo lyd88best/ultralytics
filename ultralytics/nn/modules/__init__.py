@@ -57,7 +57,7 @@ from .block import (
     RepVGGDW,
     ResNetLayer,
     SCDown,
-    TorchVision,
+    TorchVision,RCM,FuseBlockMulti,DynamicInterpolationFusion
 )
 from .conv import (
     CBAM,
@@ -88,6 +88,8 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
+from .attention import  (TripletAttention,SimAM)
+from .block import (FeaturePyramidSharedConv,PyramidContextExtraction,ContextGuideFusionModule)
 
 __all__ = (
     "Conv",
@@ -162,4 +164,8 @@ __all__ = (
     "TorchVision",
     "Index",
     "A2C2f",
+    "TripletAttention",
+    "SimAM",
+    "FeaturePyramidSharedConv","PyramidContextExtraction","ContextGuideFusionModule",
+    "RCM","FuseBlockMulti","DynamicInterpolationFusion"
 )
