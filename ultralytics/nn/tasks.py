@@ -63,7 +63,7 @@ from ultralytics.nn.modules import (
     TorchVision,
     WorldDetect,
     v10Detect, RCM, TripletAttention,FeaturePyramidSharedConv,
-    PyramidContextExtraction,FuseBlockMulti,DynamicInterpolationFusion
+    PyramidContextExtraction,FuseBlockMulti,DynamicInterpolationFusion,C3k2_MutilScaleEdgeInformationSelect,EIEStem
 )
 from ultralytics.nn.extra_modules import GetIndexOutput
 from ultralytics.nn.conv.APConv import PConv
@@ -992,7 +992,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             PSA,
             SCDown,
             C2fCIB,
-            A2C2f,
+            A2C2f,C3k2_MutilScaleEdgeInformationSelect
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1088,6 +1088,15 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [*args[1:]]
         elif m in {GetIndexOutput}:
             c2 = ch[f][args[0]]
+        elif m in {EIEStem}:
+            c1, cm, c2 = ch[f], args[0], args[1]
+            if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+                cm = make_divisible(min(cm, max_channels) * width, 8)
+            args = [c1, cm, c2, *args[2:]]
+            if m in {HGBlock}:
+                args.insert(4, n)  # number of repeats
+                n = 1
         elif m in {FuseBlockMulti}:
             c2 = ch[f[0]]
             args = [c2]

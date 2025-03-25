@@ -57,7 +57,8 @@ from .block import (
     RepVGGDW,
     ResNetLayer,
     SCDown,
-    TorchVision,RCM,FuseBlockMulti,DynamicInterpolationFusion
+    TorchVision,RCM,FuseBlockMulti,DynamicInterpolationFusion,C3k2_MutilScaleEdgeInformationSelect, C3k,
+    C3k2
 )
 from .conv import (
     CBAM,
@@ -88,8 +89,8 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
-from .attention import  (TripletAttention,SimAM)
-from .block import (FeaturePyramidSharedConv,PyramidContextExtraction,ContextGuideFusionModule)
+from .attention import  (TripletAttention,SimAM,DualDomainSelectionMechanism)
+from .block import (FeaturePyramidSharedConv,PyramidContextExtraction,ContextGuideFusionModule,EIEStem)
 
 __all__ = (
     "Conv",
@@ -167,5 +168,6 @@ __all__ = (
     "TripletAttention",
     "SimAM",
     "FeaturePyramidSharedConv","PyramidContextExtraction","ContextGuideFusionModule",
-    "RCM","FuseBlockMulti","DynamicInterpolationFusion"
+    "RCM","FuseBlockMulti","DynamicInterpolationFusion","DualDomainSelectionMechanism","C3k2_MutilScaleEdgeInformationSelect",    "C3k",
+    "C3k2","EIEStem"
 )

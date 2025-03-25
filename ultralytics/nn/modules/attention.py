@@ -658,6 +658,24 @@ class AttentionGate(nn.Module):
         return x * scale
 
 
+class DualDomainSelectionMechanism(nn.Module):
+    # https://openaccess.thecvf.com/content/ICCV2023/papers/Cui_Focal_Network_for_Image_Restoration_ICCV_2023_paper.pdf
+    # https://github.com/c-yn/FocalNet
+    # Dual-DomainSelectionMechanism
+    def __init__(self, channel) -> None:
+        super().__init__()
+        pyramid = 1
+        self.spatial_gate = DSM_SpatialGate(channel)
+        layers = [DSM_LocalAttention(channel, p=i) for i in range(pyramid - 1, -1, -1)]
+        self.local_attention = nn.Sequential(*layers)
+        self.a = nn.Parameter(torch.zeros(channel, 1, 1))
+        self.b = nn.Parameter(torch.ones(channel, 1, 1))
+
+    def forward(self, x):
+        out = self.spatial_gate(x)
+        out = self.local_attention(out)
+        return self.a * out + self.b * x
+
 class TripletAttention(nn.Module):
     def __init__(self, no_spatial=False):
         super(TripletAttention, self).__init__()

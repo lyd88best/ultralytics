@@ -6,7 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import init
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
-
+from .attention import DualDomainSelectionMechanism
+import numpy as np
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 
@@ -51,8 +52,211 @@ __all__ = (
     "SCDown",
     "TorchVision",
     "FeaturePyramidSharedConv","PyramidContextExtraction","ContextGuideFusionModule",
-    "RCM","FuseBlockMulti","DynamicInterpolationFusion"
+    "RCM","FuseBlockMulti","DynamicInterpolationFusion","C3k2_MutilScaleEdgeInformationSelect",    "C3k",
+    "C3k2","EIEStem"
 )
+
+
+######################################## MutilScaleEdgeInformationEnhance start ########################################
+
+# 1.使用 nn.AvgPool2d 对输入特征图进行平滑操作，提取其低频信息。
+# 2.将原始输入特征图与平滑后的特征图进行相减，得到增强的边缘信息（高频信息）。
+# 3.用卷积操作进一步处理增强的边缘信息。
+# 4.将处理后的边缘信息与原始输入特征图相加，以形成增强后的输出。
+class EdgeEnhancer(nn.Module):
+    def __init__(self, in_dim):
+        super().__init__()
+        self.out_conv = Conv(in_dim, in_dim, act=nn.Sigmoid())
+        self.pool = nn.AvgPool2d(3, stride=1, padding=1)
+
+    def forward(self, x):
+        edge = self.pool(x)
+        edge = x - edge
+        edge = self.out_conv(edge)
+        return x + edge
+
+
+class MutilScaleEdgeInformationEnhance(nn.Module):
+    def __init__(self, inc, bins):
+        super().__init__()
+
+        self.features = []
+        for bin in bins:
+            self.features.append(nn.Sequential(
+                nn.AdaptiveAvgPool2d(bin),
+                Conv(inc, inc // len(bins), 1),
+                Conv(inc // len(bins), inc // len(bins), 3, g=inc // len(bins))
+            ))
+        self.ees = []
+        for _ in bins:
+            self.ees.append(EdgeEnhancer(inc // len(bins)))
+        self.features = nn.ModuleList(self.features)
+        self.ees = nn.ModuleList(self.ees)
+        self.local_conv = Conv(inc, inc, 3)
+        self.final_conv = Conv(inc * 2, inc)
+
+    def forward(self, x):
+        x_size = x.size()
+        out = [self.local_conv(x)]
+        for idx, f in enumerate(self.features):
+            out.append(self.ees[idx](F.interpolate(f(x), x_size[2:], mode='bilinear', align_corners=True)))
+        return self.final_conv(torch.cat(out, 1))
+
+
+class MutilScaleEdgeInformationSelect(nn.Module):
+    def __init__(self, inc, bins):
+        super().__init__()
+
+        self.features = []
+        for bin in bins:
+            self.features.append(nn.Sequential(
+                nn.AdaptiveAvgPool2d(bin),
+                Conv(inc, inc // len(bins), 1),
+                Conv(inc // len(bins), inc // len(bins), 3, g=inc // len(bins))
+            ))
+        self.ees = []
+        for _ in bins:
+            self.ees.append(EdgeEnhancer(inc // len(bins)))
+        self.features = nn.ModuleList(self.features)
+        self.ees = nn.ModuleList(self.ees)
+        self.local_conv = Conv(inc, inc, 3)
+        self.dsm = DualDomainSelectionMechanism(inc * 2)
+        self.final_conv = Conv(inc * 2, inc)
+
+    def forward(self, x):
+        x_size = x.size()
+        out = [self.local_conv(x)]
+        for idx, f in enumerate(self.features):
+            out.append(self.ees[idx](F.interpolate(f(x), x_size[2:], mode='bilinear', align_corners=True)))
+        return self.final_conv(self.dsm(torch.cat(out, 1)))
+
+
+class CBFuse(nn.Module):
+    """CBFuse."""
+
+    def __init__(self, idx):
+        """Initializes CBFuse module with layer index for selective feature fusion."""
+        super().__init__()
+        self.idx = idx
+
+    def forward(self, xs):
+        """Forward pass through CBFuse layer."""
+        target_size = xs[-1].shape[2:]
+        res = [F.interpolate(x[self.idx[i]], size=target_size, mode="nearest") for i, x in enumerate(xs[:-1])]
+        return torch.sum(torch.stack(res + xs[-1:]), dim=0)
+
+
+class C3(nn.Module):
+    """CSP Bottleneck with 3 convolutions."""
+
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        """Initialize the CSP Bottleneck with given channels, number, shortcut, groups, and expansion values."""
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, k=((1, 1), (3, 3)), e=1.0) for _ in range(n)))
+
+    def forward(self, x):
+        """Forward pass through the CSP bottleneck with 2 convolutions."""
+        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+
+class C2f(nn.Module):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        """Initializes a CSP bottleneck with 2 convolutions and n Bottleneck blocks for faster processing."""
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+
+    def forward(self, x):
+        """Forward pass through C2f layer."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x):
+        """Forward pass using split() instead of chunk()."""
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+
+class C3f(nn.Module):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        """Initialize CSP bottleneck layer with two convolutions with arguments ch_in, ch_out, number, shortcut, groups,
+        expansion.
+        """
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv((2 + n) * c_, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(Bottleneck(c_, c_, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+
+    def forward(self, x):
+        """Forward pass through C2f layer."""
+        y = [self.cv2(x), self.cv1(x)]
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv3(torch.cat(y, 1))
+
+
+class C3k2(C2f):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
+        """Initializes the C3k2 module, a faster CSP Bottleneck with 2 convolutions and optional C3k blocks."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g) for _ in range(n)
+        )
+
+
+class C3k(C3):
+    """C3k is a CSP bottleneck module with customizable kernel sizes for feature extraction in neural networks."""
+
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, k=3):
+        """Initializes the C3k module with specified channels, number of layers, and configurations."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        # self.m = nn.Sequential(*(RepBottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
+
+class C3k_MutilScaleEdgeInformationEnhance(C3k):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, k=3):
+        super().__init__(c1, c2, n, shortcut, g, e, k)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(MutilScaleEdgeInformationEnhance(c_, [3, 6, 9, 12]) for _ in range(n)))
+
+
+class C3k2_MutilScaleEdgeInformationEnhance(C3k2):
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
+        super().__init__(c1, c2, n, c3k, e, g, shortcut)
+        self.m = nn.ModuleList(C3k_MutilScaleEdgeInformationEnhance(self.c, self.c, 2, shortcut,
+                                                                    g) if c3k else MutilScaleEdgeInformationEnhance(
+            self.c, [3, 6, 9, 12]) for _ in range(n))
+
+
+class C3k_MutilScaleEdgeInformationSelect(C3k):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, k=3):
+        super().__init__(c1, c2, n, shortcut, g, e, k)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(MutilScaleEdgeInformationSelect(c_, [3, 6, 9, 12]) for _ in range(n)))
+
+
+class C3k2_MutilScaleEdgeInformationSelect(C3k2):
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
+        super().__init__(c1, c2, n, c3k, e, g, shortcut)
+        self.m = nn.ModuleList(C3k_MutilScaleEdgeInformationSelect(self.c, self.c, 2, shortcut,
+                                                                   g) if c3k else MutilScaleEdgeInformationSelect(
+            self.c, [3, 6, 9, 12]) for _ in range(n))
+######################################## MutilScaleEdgeInformationEnhance end ########################################
 
 
 ######################################## ContextGuideFusionModule begin ########################################
@@ -1657,3 +1861,46 @@ class A2C2f(nn.Module):
         if self.gamma is not None:
             return x + self.gamma.view(-1, len(self.gamma), 1, 1) * y
         return y
+
+
+class EIEStem(nn.Module):
+    def __init__(self, inc, hidc, ouc) -> None:
+        super().__init__()
+
+        self.conv1 = Conv(inc, hidc, 3, 2)
+        self.sobel_branch = SobelConv(hidc)
+        self.pool_branch = nn.Sequential(
+            nn.ZeroPad2d((0, 1, 0, 1)),
+            nn.MaxPool2d(kernel_size=2, stride=1, padding=0, ceil_mode=True)
+        )
+        self.conv2 = Conv(hidc * 2, hidc, 3, 2)
+        self.conv3 = Conv(hidc, ouc, 1)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = torch.cat([self.sobel_branch(x), self.pool_branch(x)], dim=1)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        return x
+
+
+class SobelConv(nn.Module):
+    def __init__(self, channel) -> None:
+        super().__init__()
+
+        sobel = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]])
+        sobel_kernel_y = torch.tensor(sobel, dtype=torch.float32).unsqueeze(0).expand(channel, 1, 1, 3, 3)
+        sobel_kernel_x = torch.tensor(sobel.T, dtype=torch.float32).unsqueeze(0).expand(channel, 1, 1, 3, 3)
+
+        self.sobel_kernel_x_conv3d = nn.Conv3d(channel, channel, kernel_size=3, padding=1, groups=channel, bias=False)
+        self.sobel_kernel_y_conv3d = nn.Conv3d(channel, channel, kernel_size=3, padding=1, groups=channel, bias=False)
+
+        self.sobel_kernel_x_conv3d.weight.data = sobel_kernel_x.clone()
+        self.sobel_kernel_y_conv3d.weight.data = sobel_kernel_y.clone()
+
+        self.sobel_kernel_x_conv3d.requires_grad = False
+        self.sobel_kernel_y_conv3d.requires_grad = False
+
+    def forward(self, x):
+        return (self.sobel_kernel_x_conv3d(x[:, :, None, :, :]) + self.sobel_kernel_y_conv3d(x[:, :, None, :, :]))[:, :,
+               0]
